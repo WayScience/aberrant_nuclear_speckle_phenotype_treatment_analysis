@@ -5,6 +5,7 @@
 
 # Agent/tooling local state
 .opencode/
+AGENTS.md
 
 # Python / uv local state
 **/__pycache__/
