@@ -1,0 +1,203 @@
+﻿# This justfile is the primary entrypoint for the standalone pipeline.
+#
+# Default execution order:
+# 1. just download-profiles
+# 2. just download-load-data
+# 3. just sample-cells
+# 4. just make-zarr
+# 5. MODEL_ID=<mlflow model id> just extract-morphem
+# 6. just train-iforest
+# 7. just score-iforest
+#
+# The `run-all` recipe executes the same stages in order.
+#
+# Default outputs:
+# - downloaded_profiles_csvs/
+# - downloaded_cpg0016_csvs/
+# - outputs/sampled_anomalous_single_cells.parquet
+# - outputs/normalized_crops.zarr
+# - outputs/morphem_features.parquet
+# - outputs/isolation_forest.joblib
+# - outputs/isolation_forest_feature_columns.json
+# - outputs/scored_cells.parquet
+# - outputs/scored_by_jcp.parquet
+# - temp_single_cell_crop_work/
+#
+# Environment variable overrides used by the recipes below:
+# - OUTPUT_ROOT:
+#   Root directory for generated parquet, zarr, and model outputs.
+#   Default: outputs
+# - DOWNLOADED_PROFILES_DIR:
+#   Root directory for merged per-source CPG0016 profile outputs.
+#   Default: downloaded_profiles_csvs
+# - DOWNLOADED_CPG0016_CSV_DIR:
+#   Root directory for downloaded load_data_with_illum.csv files.
+#   Default: downloaded_cpg0016_csvs
+# - CROP_WORK_DIR:
+#   Scratch directory used while downloading and correcting DNA crops.
+#   Default: temp_single_cell_crop_work
+# - MAX_CONCURRENT_REQUESTS:
+#   AWS CLI S3 concurrency used by the analysis CSV profile download stage.
+#   Default: 50
+# - LOAD_DATA_WORKERS:
+#   Worker count used by the load_data_with_illum.csv downloader.
+#   Default: 8
+# - CROP_DOWNLOAD_WORKERS:
+#   Worker count used while downloading DNA TIFF and illumination NPY files.
+#   Default: 8
+# - MODEL_ID:
+#   Required MLflow logged model identifier for the translation stage.
+# - MLFLOW_TRACKING_URI:
+#   MLflow tracking backend used to resolve MODEL_ID.
+#   Default: sqlite:////home/camo/projects/nuclear_speckles_analysis/mlflow.db
+# - MORPHEM_BATCH_SIZE:
+#   Batch size used for translation and MorphEm inference.
+#   Default: 8
+# - MORPHEM_DEVICE:
+#   Device used for translation and embedding extraction.
+#   Default: auto
+
+set shell := ["bash", "-uc"]
+
+# Sync the standalone uv environment including test dependencies.
+# Run this once before using the rest of the recipes.
+# Sync the standalone uv environment.
+setup:
+    uv sync --group test
+
+# Print the fully resolved default or overridden paths used by the pipeline.
+# This is helpful before a long run to confirm where outputs will land.
+# Print the resolved pipeline paths.
+show-paths:
+    output_root="${OUTPUT_ROOT:-outputs}"; \
+    downloaded_profiles_dir="${DOWNLOADED_PROFILES_DIR:-downloaded_profiles_csvs}"; \
+    downloaded_cpg0016_csv_dir="${DOWNLOADED_CPG0016_CSV_DIR:-downloaded_cpg0016_csvs}"; \
+    crop_work_dir="${CROP_WORK_DIR:-temp_single_cell_crop_work}"; \
+    printf 'downloaded_profiles_dir=%s\n' "$downloaded_profiles_dir"; \
+    printf 'downloaded_cpg0016_csv_dir=%s\n' "$downloaded_cpg0016_csv_dir"; \
+    printf 'sampled_parquet=%s\n' "$output_root/sampled_anomalous_single_cells.parquet"; \
+    printf 'normalized_zarr=%s\n' "$output_root/normalized_crops.zarr"; \
+    printf 'morphem_features_parquet=%s\n' "$output_root/morphem_features.parquet"; \
+    printf 'isolation_forest_model=%s\n' "$output_root/isolation_forest.joblib"; \
+    printf 'feature_columns_json=%s\n' "$output_root/isolation_forest_feature_columns.json"; \
+    printf 'scored_cells_parquet=%s\n' "$output_root/scored_cells.parquet"; \
+    printf 'scored_by_jcp_parquet=%s\n' "$output_root/scored_by_jcp.parquet"; \
+    printf 'crop_work_dir=%s\n' "$crop_work_dir"
+
+# Download Image.csv and Nuclei.csv for the supported sources and merge each
+# pair into Nuclei_Image_merged.parquet. This recipe writes under
+# DOWNLOADED_PROFILES_DIR and uses the wrapper shell script, which internally
+# calls the one-source Python downloader for each supported source.
+# Download and merge per-source analysis profiles.
+download-profiles:
+    downloaded_profiles_dir="${DOWNLOADED_PROFILES_DIR:-downloaded_profiles_csvs}"; \
+    max_concurrent_requests="${MAX_CONCURRENT_REQUESTS:-50}"; \
+    bash scripts/run_cpg0016_source_profiles.sh --output-dir "$downloaded_profiles_dir" --max-concurrent-requests "$max_concurrent_requests"
+
+# Download the CPG0016 load_data_with_illum.csv files required by the
+# sampling stage. Outputs are written under DOWNLOADED_CPG0016_CSV_DIR.
+# Download load_data_with_illum.csv metadata.
+download-load-data:
+    downloaded_cpg0016_csv_dir="${DOWNLOADED_CPG0016_CSV_DIR:-downloaded_cpg0016_csvs}"; \
+    load_data_workers="${LOAD_DATA_WORKERS:-8}"; \
+    uv run python scripts/download_cpg0016_load_data_with_illum.py --output-dir "$downloaded_cpg0016_csv_dir" --workers "$load_data_workers"
+
+# Read merged per-source parquets plus downloaded load-data metadata and write
+# the sampled single-cell parquet consumed by later image and MorphEm stages.
+# Reads:
+# - DOWNLOADED_PROFILES_DIR
+# - DOWNLOADED_CPG0016_CSV_DIR
+# Writes:
+# - OUTPUT_ROOT/sampled_anomalous_single_cells.parquet
+# Write the sampled single-cell parquet.
+sample-cells:
+    downloaded_profiles_dir="${DOWNLOADED_PROFILES_DIR:-downloaded_profiles_csvs}"; \
+    downloaded_cpg0016_csv_dir="${DOWNLOADED_CPG0016_CSV_DIR:-downloaded_cpg0016_csvs}"; \
+    output_root="${OUTPUT_ROOT:-outputs}"; \
+    mkdir -p "$output_root"; \
+    uv run python scripts/sample_anomalous_single_cells_fs.py --downloaded-profiles-dir "$downloaded_profiles_dir" --load-data-csv-dir "$downloaded_cpg0016_csv_dir" --output-parquet "$output_root/sampled_anomalous_single_cells.parquet"
+
+# Download DNA TIFF and illumination NPY files for the sampled rows, generate
+# corrected 128x128 crops, normalize them, and write an ordered zarr store.
+# Reads:
+# - OUTPUT_ROOT/sampled_anomalous_single_cells.parquet
+# Writes:
+# - OUTPUT_ROOT/normalized_crops.zarr
+# - CROP_WORK_DIR during processing
+# Build the normalized crop zarr store.
+make-zarr:
+    output_root="${OUTPUT_ROOT:-outputs}"; \
+    crop_work_dir="${CROP_WORK_DIR:-temp_single_cell_crop_work}"; \
+    crop_workers="${CROP_DOWNLOAD_WORKERS:-8}"; \
+    mkdir -p "$output_root"; \
+    uv run python scripts/download_correct_crop_normalize_to_zarr.py --input-parquet "$output_root/sampled_anomalous_single_cells.parquet" --output-zarr "$output_root/normalized_crops.zarr" --work-dir "$crop_work_dir" --workers "$crop_workers"
+
+# Load the normalized zarr plus the sampled parquet, run the MLflow
+# translation model, and then extract MorphEm embeddings. The output parquet
+# is the shared input for both training and scoring recipes.
+# Reads:
+# - OUTPUT_ROOT/normalized_crops.zarr
+# - OUTPUT_ROOT/sampled_anomalous_single_cells.parquet
+# Writes:
+# - OUTPUT_ROOT/morphem_features.parquet
+# Translate crops and extract MorphEm features.
+extract-morphem:
+    output_root="${OUTPUT_ROOT:-outputs}"; \
+    model_id="${MODEL_ID:?Set MODEL_ID to the MLflow logged model identifier.}"; \
+    mlflow_tracking_uri="${MLFLOW_TRACKING_URI:-sqlite:////home/camo/projects/nuclear_speckles_analysis/mlflow.db}"; \
+    batch_size="${MORPHEM_BATCH_SIZE:-8}"; \
+    device="${MORPHEM_DEVICE:-auto}"; \
+    mkdir -p "$output_root"; \
+    uv run python scripts/translate_and_extract_morphem.py --input-zarr "$output_root/normalized_crops.zarr" --input-parquet "$output_root/sampled_anomalous_single_cells.parquet" --output-parquet "$output_root/morphem_features.parquet" --model-id "$model_id" --mlflow-tracking-uri "$mlflow_tracking_uri" --batch-size "$batch_size" --device "$device"
+
+# Train an Isolation Forest using the MorphEm feature parquet and write both
+# the model artifact and the sidecar JSON listing the feature columns used.
+# Reads:
+# - OUTPUT_ROOT/morphem_features.parquet
+# Writes:
+# - OUTPUT_ROOT/isolation_forest.joblib
+# - OUTPUT_ROOT/isolation_forest_feature_columns.json
+# Train the Isolation Forest model.
+train-iforest:
+    output_root="${OUTPUT_ROOT:-outputs}"; \
+    mkdir -p "$output_root"; \
+    uv run python scripts/train_isolation_forest.py --input-parquet "$output_root/morphem_features.parquet" --output-model "$output_root/isolation_forest.joblib" --output-feature-columns "$output_root/isolation_forest_feature_columns.json"
+
+# Score the same MorphEm feature parquet used for training and write both the
+# per-cell and Metadata_JCP2022-level aggregate outputs.
+# Reads:
+# - OUTPUT_ROOT/morphem_features.parquet
+# - OUTPUT_ROOT/isolation_forest.joblib
+# Writes:
+# - OUTPUT_ROOT/scored_cells.parquet
+# - OUTPUT_ROOT/scored_by_jcp.parquet
+# Score the MorphEm feature parquet.
+score-iforest:
+    output_root="${OUTPUT_ROOT:-outputs}"; \
+    mkdir -p "$output_root"; \
+    uv run python scripts/score_isolation_forest.py --input-parquet "$output_root/morphem_features.parquet" --input-model "$output_root/isolation_forest.joblib" --output-cell-parquet "$output_root/scored_cells.parquet" --output-jcp-parquet "$output_root/scored_by_jcp.parquet"
+
+# Execute the full pipeline in the documented order. This recipe is intended
+# for straightforward end-to-end runs and deliberately trains and scores on
+# the same MorphEm feature parquet, matching the requested workflow.
+# Execute the full pipeline end to end.
+run-all:
+    downloaded_profiles_dir="${DOWNLOADED_PROFILES_DIR:-downloaded_profiles_csvs}"; \
+    downloaded_cpg0016_csv_dir="${DOWNLOADED_CPG0016_CSV_DIR:-downloaded_cpg0016_csvs}"; \
+    output_root="${OUTPUT_ROOT:-outputs}"; \
+    crop_work_dir="${CROP_WORK_DIR:-temp_single_cell_crop_work}"; \
+    max_concurrent_requests="${MAX_CONCURRENT_REQUESTS:-50}"; \
+    load_data_workers="${LOAD_DATA_WORKERS:-8}"; \
+    crop_workers="${CROP_DOWNLOAD_WORKERS:-8}"; \
+    model_id="${MODEL_ID:?Set MODEL_ID to the MLflow logged model identifier.}"; \
+    mlflow_tracking_uri="${MLFLOW_TRACKING_URI:-sqlite:////home/camo/projects/nuclear_speckles_analysis/mlflow.db}"; \
+    batch_size="${MORPHEM_BATCH_SIZE:-8}"; \
+    device="${MORPHEM_DEVICE:-auto}"; \
+    mkdir -p "$output_root"; \
+    bash scripts/run_cpg0016_source_profiles.sh --output-dir "$downloaded_profiles_dir" --max-concurrent-requests "$max_concurrent_requests"; \
+    uv run python scripts/download_cpg0016_load_data_with_illum.py --output-dir "$downloaded_cpg0016_csv_dir" --workers "$load_data_workers"; \
+    uv run python scripts/sample_anomalous_single_cells_fs.py --downloaded-profiles-dir "$downloaded_profiles_dir" --load-data-csv-dir "$downloaded_cpg0016_csv_dir" --output-parquet "$output_root/sampled_anomalous_single_cells.parquet"; \
+    uv run python scripts/download_correct_crop_normalize_to_zarr.py --input-parquet "$output_root/sampled_anomalous_single_cells.parquet" --output-zarr "$output_root/normalized_crops.zarr" --work-dir "$crop_work_dir" --workers "$crop_workers"; \
+    uv run python scripts/translate_and_extract_morphem.py --input-zarr "$output_root/normalized_crops.zarr" --input-parquet "$output_root/sampled_anomalous_single_cells.parquet" --output-parquet "$output_root/morphem_features.parquet" --model-id "$model_id" --mlflow-tracking-uri "$mlflow_tracking_uri" --batch-size "$batch_size" --device "$device"; \
+    uv run python scripts/train_isolation_forest.py --input-parquet "$output_root/morphem_features.parquet" --output-model "$output_root/isolation_forest.joblib" --output-feature-columns "$output_root/isolation_forest_feature_columns.json"; \
+    uv run python scripts/score_isolation_forest.py --input-parquet "$output_root/morphem_features.parquet" --input-model "$output_root/isolation_forest.joblib" --output-cell-parquet "$output_root/scored_cells.parquet" --output-jcp-parquet "$output_root/scored_by_jcp.parquet"

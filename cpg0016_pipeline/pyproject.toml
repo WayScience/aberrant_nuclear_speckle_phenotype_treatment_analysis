@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cpg0016-morphem-pipeline"
+version = "0.1.0"
+description = "Standalone CPG0016 MorphEm and Isolation Forest pipeline utilities."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "BSD-3-Clause" }
+authors = [{ name = "WayScience" }]
+dependencies = [
+  "huggingface-hub>=0.34,<1",
+  "imagecodecs>=2024.12.30",
+  "joblib>=1.4,<2",
+  "mlflow>=2.17,<4",
+  "numpy>=2.0,<3",
+  "pandas>=2.2,<4",
+  "pyarrow>=18,<100",
+  "s3fs>=2023.1.0",
+  "safetensors>=0.5,<1",
+  "scikit-learn>=1.5,<2",
+  "tifffile>=2025.5.10",
+  "torch>=2.4,<3",
+  "transformers>=4.44,<5",
+  "zarr>=2.18,<4",
+]
+
+[project.urls]
+Repository = "https://github.com/WayScience/jump_image_data_downloader"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[dependency-groups]
+test = [
+  "pytest>=8.3,<9",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

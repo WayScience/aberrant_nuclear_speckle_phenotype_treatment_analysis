@@ -1,0 +1,33 @@
+# OS/editor noise
+.DS_Store
+*.swp
+*.swo
+
+# Agent/tooling local state
+.opencode/
+AGENTS.md
+
+# Python / uv local state
+**/__pycache__/
+**/*.py[cod]
+**/*.egg-info/
+cpg0016_pipeline/.venv/
+cpg0016_pipeline/.pytest_cache/
+
+# Default pipeline outputs
+cpg0016_pipeline/outputs/
+cpg0016_pipeline/downloaded_profiles_csvs/
+cpg0016_pipeline/downloaded_cpg0016_csvs/
+cpg0016_pipeline/temp_single_cell_crop_work/
+
+# Documented override/output variants
+cpg0016_pipeline/custom_outputs/
+cpg0016_pipeline/custom_profiles/
+cpg0016_pipeline/custom_load_data/
+cpg0016_pipeline/custom_crop_work/
+
+# Common ad hoc output variants
+cpg0016_pipeline/*outputs/
+cpg0016_pipeline/*profiles/
+cpg0016_pipeline/*load_data/
+cpg0016_pipeline/*crop_work/
